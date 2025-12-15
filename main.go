@@ -286,5 +286,6 @@ func main() {
 	http.HandleFunc("/version", versionHandler)
 
 	log.Printf("Starting homelab-test v%s on port %s", Version, port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// TLS termination handled by Traefik ingress controller
+	log.Fatal(http.ListenAndServe(":"+port, nil)) // nosemgrep: go.lang.security.audit.net.use-tls.use-tls
 }

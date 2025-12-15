@@ -1,0 +1,57 @@
+# Woodpecker CI Pipeline Example
+#
+# This file shows how to add app-specific pipeline steps.
+# Rename to `pipeline.yml` to activate.
+#
+# NOTE: Most apps don't need this file at all!
+# The config-service automatically provides:
+#   - Pre-build: SAST, secret scanning, SCA, IaC scanning
+#   - Build: Auto-detected from Dockerfile (buildah + Harbor push)
+#   - Post-build: SBOM, image scanning, image signing
+#
+# Only create a pipeline.yml if your app needs EXTRA steps like:
+#   - Custom linters (golangci-lint, eslint, etc.)
+#   - Unit/integration tests
+#   - Custom build arguments
+#   - Multi-stage deployments
+#
+# Your steps will be inserted BETWEEN pre-build and post-build baseline steps.
+# If you define a "build" step, it replaces the auto-build (Dockerfile detection is skipped).
+
+steps:
+  # Example: Go-specific linting (optional)
+  - name: go-lint
+    image: golangci/golangci-lint:latest
+    commands:
+      - golangci-lint run --timeout=5m
+
+  # Example: Unit tests (optional)
+  - name: test
+    image: golang:1.23-alpine
+    commands:
+      - go test -v -race ./...
+
+  # Example: Custom build with extra args (replaces auto-build)
+  # Uncomment only if you need custom build behavior
+  # - name: build
+  #   image: quay.io/buildah/stable:latest
+  #   privileged: true
+  #   environment:
+  #     HARBOR_USER:
+  #       from_secret: harbor_username
+  #     HARBOR_PASS:
+  #       from_secret: harbor_password
+  #     HARBOR_REGISTRY:
+  #       from_secret: harbor_registry
+  #   commands:
+  #     - |
+  #       VERSION=${CI_COMMIT_SHA:0:7}
+  #       IMAGE="$HARBOR_REGISTRY/homelab/$CI_REPO_NAME"
+  #       
+  #       buildah build \
+  #         --build-arg VERSION="$VERSION" \
+  #         --build-arg CUSTOM_ARG="my-value" \
+  #         -t "$IMAGE:$VERSION" .
+  #       
+  #       buildah login -u "$HARBOR_USER" -p "$HARBOR_PASS" "$HARBOR_REGISTRY"
+  #       buildah push "$IMAGE:$VERSION"

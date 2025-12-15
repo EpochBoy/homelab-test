@@ -4,14 +4,50 @@ Test repository for homelab Kubernetes cluster CI/CD pipeline testing.
 
 ## Purpose
 
-- **Woodpecker CI**: Validates baseline security pipeline injection
-- **Kargo**: Tests environment promotion (dev → staging → prod)
-- **Argo Rollouts**: Validates canary/blue-green deployments
-- **DAST**: Post-deployment security scanning with OWASP ZAP
+This is a **proof-of-concept app** demonstrating the complete homelab deployment flow.
 
-## Application
+App repos should be **minimal** - just source code and a Dockerfile. Everything else (deployment manifests, CI pipelines, monitoring) lives in the **infra repo**.
 
-Simple Go web server that returns JSON health status and version info.
+## What's in this repo (app concerns)
+
+```text
+homelab-test/
+├── Dockerfile              # How to build the app
+├── main.go, go.mod         # Source code
+├── VERSION                  # App version
+└── README.md               # This file
+```
+
+## What's in the infra repo (platform concerns)
+
+```text
+homelab/
+├── kubernetes/apps/homelab-test/   # Deployment manifests
+├── ansible/tasks/homelab-test-deploy.yml  # ArgoCD Application
+└── Woodpecker Config Service       # Auto-generates CI pipeline
+```
+
+## Complete Deployment Flow
+
+```text
+1. DEVELOPER PUSHES CODE
+   └── Push to EpochBoy/homelab-test main branch
+
+2. WOODPECKER CI (auto-triggered)
+   └── Config Service auto-generates pipeline:
+       ├── Pre-build: SAST, secret scan, SCA, IaC scan
+       ├── Build: Detected Dockerfile → buildah build/push
+       └── Post-build: SBOM, image scan, image signing
+
+3. IMAGE PUSHED TO HARBOR
+   └── registry.epoch.engineering/homelab/homelab-test:<sha>
+
+4. RENOVATE DETECTS NEW IMAGE
+   └── Creates PR to homelab repo updating image tag
+
+5. ARGOCD SYNCS
+   └── Deploys to cluster with new image
+```
 
 ## Local Development
 
@@ -26,14 +62,6 @@ docker build -t homelab-test .
 curl http://localhost:8080/health
 curl http://localhost:8080/version
 ```
-
-## Deployment
-
-This app is deployed via:
-1. **Woodpecker CI** builds and pushes to Harbor
-2. **ArgoCD Image Updater** detects new images
-3. **Kargo** promotes through stages (when configured)
-4. **Argo Rollouts** handles progressive delivery
 
 ## Endpoints
 

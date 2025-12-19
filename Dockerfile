@@ -1,5 +1,5 @@
 # Build stage
-FROM docker.io/library/golang:1.23-alpine AS builder
+FROM docker.io/library/golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f AS builder
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o homelab-test .
 
 # Runtime stage
-FROM docker.io/library/alpine:3.21
+FROM docker.io/library/alpine:3.21@sha256:5405e8f36ce1878720f71217d664aa3dea32e5e5df11acbf07fc78ef5661465b
 
 # Install ca-certificates for HTTPS
 RUN apk --no-cache add ca-certificates

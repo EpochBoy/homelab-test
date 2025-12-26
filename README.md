@@ -91,3 +91,4 @@ curl http://localhost:8080/version
 | `GET /health` | Health check (for probes) |
 | `GET /version` | Version info (git commit, build time) |
 | `GET /` | Welcome page |
+# CI Test Fri Dec 26 18:07:17 CET 2025

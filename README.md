@@ -165,7 +165,8 @@ curl https://test.<your-domain>/chaos?action=load&count=50
 ```
 
 **Alert Flow:**
-```
+
+```text
 /chaos?action=error → epochcloud_errors_total ↑ → Prometheus scrapes →
 AlertManager fires EpochCloudTestHighErrorRate → ntfy webhook →
 ntfy.epochcloud-warning topic → mobile notification

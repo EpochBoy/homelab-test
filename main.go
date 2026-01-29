@@ -10,8 +10,11 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -39,6 +42,25 @@ var logger *slog.Logger
 
 // Tracer - OpenTelemetry tracer for Tempo
 var tracer trace.Tracer
+
+// RabbitMQ connection and channel
+var (
+	rabbitConn    *amqp.Connection
+	rabbitChannel *amqp.Channel
+	rabbitMu      sync.RWMutex
+	rabbitEnabled bool
+	// Stores last N consumed messages for demo display
+	consumedMessages     []ConsumedMessage
+	consumedMessagesMu   sync.RWMutex
+	maxConsumedMessages  = 10
+)
+
+// ConsumedMessage holds a consumed message for display
+type ConsumedMessage struct {
+	Body      string    `json:"body"`
+	Timestamp time.Time `json:"timestamp"`
+	TraceID   string    `json:"trace_id"`
+}
 
 // Prometheus metrics
 var (
@@ -82,6 +104,35 @@ var (
 			Help: "Total number of errors by type",
 		},
 		[]string{"type"},
+	)
+
+	// RabbitMQ metrics
+	rabbitMessagesPublished = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_rabbitmq_messages_published_total",
+			Help: "Total number of messages published to RabbitMQ",
+		},
+	)
+
+	rabbitMessagesConsumed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_rabbitmq_messages_consumed_total",
+			Help: "Total number of messages consumed from RabbitMQ",
+		},
+	)
+
+	rabbitPublishErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "epochcloud_rabbitmq_publish_errors_total",
+			Help: "Total number of publish errors",
+		},
+	)
+
+	rabbitConnectionStatus = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "epochcloud_rabbitmq_connected",
+			Help: "RabbitMQ connection status (1=connected, 0=disconnected)",
+		},
 	)
 )
 
@@ -254,7 +305,17 @@ const pageTemplate = `<!DOCTYPE html>
             </div>
         </div>
         <div class="card">
-            <h2>🔥 Chaos Testing</h2>
+            <h2>� RabbitMQ Demo</h2>
+            <p style="color: #888; margin-bottom: 1rem;">Message broker integration with pub/sub demo:</p>
+            <div class="info-grid">
+                <div class="info-item"><label>/rabbitmq/status</label><p>Connection status & consumed messages</p></div>
+                <div class="info-item"><label>/rabbitmq/publish</label><p>Publish message (GET or POST)</p></div>
+                <div class="info-item"><label>/rabbitmq/publish?message=Hello</label><p>Publish custom message</p></div>
+            </div>
+            <p style="color: #666; margin-top: 1rem; font-size: 0.8rem;">Messages auto-consumed by background worker. View metrics: epochcloud_rabbitmq_*</p>
+        </div>
+        <div class="card">
+            <h2>�🔥 Chaos Testing</h2>
             <p style="color: #888; margin-bottom: 1rem;">Test the AlertManager → ntfy notification pipeline:</p>
             <div class="info-grid">
                 <div class="info-item"><label>/chaos?action=error</label><p>Triggers 500 error, increments error counter</p></div>
@@ -549,6 +610,306 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// initRabbitMQ initializes RabbitMQ connection if credentials are available
+func initRabbitMQ(ctx context.Context) error {
+	host := os.Getenv("RABBITMQ_HOST")
+	port := os.Getenv("RABBITMQ_PORT")
+	user := os.Getenv("RABBITMQ_USERNAME")
+	pass := os.Getenv("RABBITMQ_PASSWORD")
+	vhost := os.Getenv("RABBITMQ_VHOST")
+
+	// If no host configured, RabbitMQ is optional
+	if host == "" {
+		logger.Info("RabbitMQ not configured, skipping initialization")
+		rabbitConnectionStatus.Set(0)
+		return nil
+	}
+
+	if port == "" {
+		port = "5672"
+	}
+	if vhost == "" {
+		vhost = "/"
+	}
+
+	url := fmt.Sprintf("amqp://%s:%s@%s:%s/%s", user, pass, host, port, vhost)
+
+	conn, err := amqp.Dial(url)
+	if err != nil {
+		logger.Error("failed to connect to RabbitMQ",
+			slog.String("host", host),
+			slog.String("error", err.Error()),
+		)
+		rabbitConnectionStatus.Set(0)
+		return err
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		conn.Close()
+		logger.Error("failed to open RabbitMQ channel", slog.String("error", err.Error()))
+		rabbitConnectionStatus.Set(0)
+		return err
+	}
+
+	rabbitMu.Lock()
+	rabbitConn = conn
+	rabbitChannel = ch
+	rabbitEnabled = true
+	rabbitMu.Unlock()
+
+	rabbitConnectionStatus.Set(1)
+	logger.Info("RabbitMQ connected",
+		slog.String("host", host),
+		slog.String("vhost", vhost),
+	)
+
+	// Start background consumer for demo queue
+	go startConsumer(ctx)
+
+	return nil
+}
+
+// startConsumer starts a background consumer for the demo queue
+func startConsumer(ctx context.Context) {
+	queueName := os.Getenv("RABBITMQ_QUEUE")
+	if queueName == "" {
+		queueName = "epochcloud-demo"
+	}
+
+	rabbitMu.RLock()
+	ch := rabbitChannel
+	enabled := rabbitEnabled
+	rabbitMu.RUnlock()
+
+	if !enabled || ch == nil {
+		return
+	}
+
+	// Declare the queue (idempotent)
+	_, err := ch.QueueDeclare(
+		queueName,
+		true,  // durable
+		false, // auto-delete
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	if err != nil {
+		logger.Error("failed to declare queue", slog.String("queue", queueName), slog.String("error", err.Error()))
+		return
+	}
+
+	msgs, err := ch.Consume(
+		queueName,
+		"epochcloud-test-consumer", // consumer tag
+		true,                       // auto-ack
+		false,                      // exclusive
+		false,                      // no-local
+		false,                      // no-wait
+		nil,                        // args
+	)
+	if err != nil {
+		logger.Error("failed to start consumer", slog.String("queue", queueName), slog.String("error", err.Error()))
+		return
+	}
+
+	logger.Info("RabbitMQ consumer started", slog.String("queue", queueName))
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("RabbitMQ consumer shutting down")
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				logger.Warn("RabbitMQ consumer channel closed")
+				rabbitConnectionStatus.Set(0)
+				return
+			}
+			rabbitMessagesConsumed.Inc()
+
+			consumed := ConsumedMessage{
+				Body:      string(msg.Body),
+				Timestamp: time.Now(),
+				TraceID:   msg.MessageId, // Use MessageId as trace correlation
+			}
+
+			consumedMessagesMu.Lock()
+			consumedMessages = append([]ConsumedMessage{consumed}, consumedMessages...)
+			if len(consumedMessages) > maxConsumedMessages {
+				consumedMessages = consumedMessages[:maxConsumedMessages]
+			}
+			consumedMessagesMu.Unlock()
+
+			logger.Info("message consumed",
+				slog.String("queue", queueName),
+				slog.String("body", string(msg.Body)),
+			)
+		}
+	}
+}
+
+// RabbitMQPublishRequest is the request body for publishing a message
+type RabbitMQPublishRequest struct {
+	Message string `json:"message"`
+}
+
+// RabbitMQResponse is the response for RabbitMQ operations
+type RabbitMQResponse struct {
+	Success   bool               `json:"success"`
+	Message   string             `json:"message"`
+	TraceID   string             `json:"trace_id,omitempty"`
+	Consumed  []ConsumedMessage  `json:"consumed,omitempty"`
+	Connected bool               `json:"connected"`
+	Timestamp string             `json:"timestamp"`
+}
+
+// rabbitStatusHandler returns RabbitMQ connection status and consumed messages
+func rabbitStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "rabbitStatus")
+	defer span.End()
+
+	rabbitMu.RLock()
+	connected := rabbitEnabled && rabbitConn != nil && !rabbitConn.IsClosed()
+	rabbitMu.RUnlock()
+
+	consumedMessagesMu.RLock()
+	messages := make([]ConsumedMessage, len(consumedMessages))
+	copy(messages, consumedMessages)
+	consumedMessagesMu.RUnlock()
+
+	resp := RabbitMQResponse{
+		Success:   true,
+		Message:   "RabbitMQ status",
+		Connected: connected,
+		Consumed:  messages,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	logger.InfoContext(ctx, "rabbitmq status check",
+		slog.Bool("connected", connected),
+		slog.Int("consumed_messages", len(messages)),
+		slog.String("trace_id", span.SpanContext().TraceID().String()),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// rabbitPublishHandler publishes a message to RabbitMQ
+func rabbitPublishHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, span := tracer.Start(ctx, "rabbitPublish")
+	defer span.End()
+
+	rabbitMu.RLock()
+	ch := rabbitChannel
+	enabled := rabbitEnabled
+	rabbitMu.RUnlock()
+
+	if !enabled || ch == nil {
+		resp := RabbitMQResponse{
+			Success:   false,
+			Message:   "RabbitMQ not connected",
+			Connected: false,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Get message from query param or body
+	message := r.URL.Query().Get("message")
+	if message == "" && r.Method == http.MethodPost {
+		var req RabbitMQPublishRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			message = req.Message
+		}
+	}
+	if message == "" {
+		message = fmt.Sprintf("Hello from EpochCloud at %s", time.Now().Format(time.RFC3339))
+	}
+
+	queueName := os.Getenv("RABBITMQ_QUEUE")
+	if queueName == "" {
+		queueName = "epochcloud-demo"
+	}
+
+	traceID := span.SpanContext().TraceID().String()
+
+	err := ch.PublishWithContext(ctx,
+		"",        // exchange (default)
+		queueName, // routing key (queue name)
+		false,     // mandatory
+		false,     // immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(message),
+			MessageId:   traceID, // Trace correlation
+			Timestamp:   time.Now(),
+		},
+	)
+
+	if err != nil {
+		rabbitPublishErrors.Inc()
+		logger.ErrorContext(ctx, "failed to publish message",
+			slog.String("queue", queueName),
+			slog.String("error", err.Error()),
+			slog.String("trace_id", traceID),
+		)
+		resp := RabbitMQResponse{
+			Success:   false,
+			Message:   "Failed to publish: " + err.Error(),
+			Connected: true,
+			TraceID:   traceID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	rabbitMessagesPublished.Inc()
+	logger.InfoContext(ctx, "message published",
+		slog.String("queue", queueName),
+		slog.String("message", message),
+		slog.String("trace_id", traceID),
+	)
+
+	resp := RabbitMQResponse{
+		Success:   true,
+		Message:   fmt.Sprintf("Published to %s: %s", queueName, message),
+		Connected: true,
+		TraceID:   traceID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// closeRabbitMQ closes RabbitMQ connections
+func closeRabbitMQ() {
+	rabbitMu.Lock()
+	defer rabbitMu.Unlock()
+
+	if rabbitChannel != nil {
+		rabbitChannel.Close()
+		rabbitChannel = nil
+	}
+	if rabbitConn != nil {
+		rabbitConn.Close()
+		rabbitConn = nil
+	}
+	rabbitEnabled = false
+	rabbitConnectionStatus.Set(0)
+	logger.Info("RabbitMQ connections closed")
+}
+
 func main() {
 	initLogger()
 
@@ -572,6 +933,14 @@ func main() {
 		}()
 	}
 
+	// Initialize RabbitMQ (optional - won't fail if not configured)
+	if err := initRabbitMQ(ctx); err != nil {
+		logger.Warn("RabbitMQ initialization failed, continuing without messaging",
+			slog.String("error", err.Error()),
+		)
+	}
+	defer closeRabbitMQ()
+
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)
 
 	mux := http.NewServeMux()
@@ -579,6 +948,9 @@ func main() {
 	mux.Handle("/health", metricsMiddleware("/health", healthHandler))
 	mux.Handle("/version", metricsMiddleware("/version", versionHandler))
 	mux.Handle("/chaos", metricsMiddleware("/chaos", chaosHandler))
+	// RabbitMQ demo endpoints
+	mux.Handle("/rabbitmq/status", metricsMiddleware("/rabbitmq/status", rabbitStatusHandler))
+	mux.Handle("/rabbitmq/publish", metricsMiddleware("/rabbitmq/publish", rabbitPublishHandler))
 	mux.Handle("/metrics", promhttp.Handler())
 
 	server := &http.Server{
@@ -593,6 +965,7 @@ func main() {
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
 		logger.Info("shutting down")
+		cancel() // Cancel context to stop RabbitMQ consumer
 		shutdownCtx, c := context.WithTimeout(context.Background(), 30*time.Second)
 		defer c()
 		server.Shutdown(shutdownCtx)
@@ -604,21 +977,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-// test 1767625973
-// test2 1767626122
-// test3 1767626184
-// test1 1767626512
-// test2 1767626520
-// test3 1767626529
-// test-terminate1 1767626716
-// test-terminate2 1767626726
-// final-test1 1767626992
-// final-test2 1767627002
-// cancel test 1767634496
-// Test cancel-in-progress status fix 1767637323
-// Test cancel-in-progress status fix 1767637327
-// Trigger cancel 1767637344
-// Test timestamp fix 1767637721
-// Trigger cancel test 1767637774
-// Final test 1767639503
-// Cancel test 1767639554

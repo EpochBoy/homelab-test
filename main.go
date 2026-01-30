@@ -610,13 +610,9 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// initRabbitMQ initializes RabbitMQ connection if credentials are available
+// initRabbitMQ starts background RabbitMQ connection manager with retry logic
 func initRabbitMQ(ctx context.Context) error {
 	host := os.Getenv("RABBITMQ_HOST")
-	port := os.Getenv("RABBITMQ_PORT")
-	user := os.Getenv("RABBITMQ_USERNAME")
-	pass := os.Getenv("RABBITMQ_PASSWORD")
-	vhost := os.Getenv("RABBITMQ_VHOST")
 
 	// If no host configured, RabbitMQ is optional
 	if host == "" {
@@ -624,6 +620,20 @@ func initRabbitMQ(ctx context.Context) error {
 		rabbitConnectionStatus.Set(0)
 		return nil
 	}
+
+	// Start background connection manager (non-blocking)
+	go rabbitConnectionManager(ctx)
+
+	return nil
+}
+
+// rabbitConnectionManager maintains RabbitMQ connection with exponential backoff retry
+func rabbitConnectionManager(ctx context.Context) {
+	host := os.Getenv("RABBITMQ_HOST")
+	port := os.Getenv("RABBITMQ_PORT")
+	user := os.Getenv("RABBITMQ_USERNAME")
+	pass := os.Getenv("RABBITMQ_PASSWORD")
+	vhost := os.Getenv("RABBITMQ_VHOST")
 
 	if port == "" {
 		port = "5672"
@@ -634,40 +644,127 @@ func initRabbitMQ(ctx context.Context) error {
 
 	url := fmt.Sprintf("amqp://%s:%s@%s:%s/%s", user, pass, host, port, vhost)
 
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		logger.Error("failed to connect to RabbitMQ",
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("RabbitMQ connection manager shutting down")
+			return
+		default:
+		}
+
+		// Check if already connected
+		rabbitMu.RLock()
+		connected := rabbitEnabled && rabbitConn != nil && !rabbitConn.IsClosed()
+		rabbitMu.RUnlock()
+
+		if connected {
+			// Already connected, wait and check again
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+
+		// Attempt connection
+		logger.Info("attempting RabbitMQ connection",
 			slog.String("host", host),
-			slog.String("error", err.Error()),
+			slog.String("vhost", vhost),
 		)
-		rabbitConnectionStatus.Set(0)
-		return err
+
+		conn, err := amqp.Dial(url)
+		if err != nil {
+			logger.Warn("RabbitMQ connection failed, will retry",
+				slog.String("host", host),
+				slog.String("error", err.Error()),
+				slog.Duration("retry_in", backoff),
+			)
+			rabbitConnectionStatus.Set(0)
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			// Exponential backoff
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		ch, err := conn.Channel()
+		if err != nil {
+			conn.Close()
+			logger.Warn("RabbitMQ channel open failed, will retry",
+				slog.String("error", err.Error()),
+				slog.Duration("retry_in", backoff),
+			)
+			rabbitConnectionStatus.Set(0)
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Success - update state
+		rabbitMu.Lock()
+		rabbitConn = conn
+		rabbitChannel = ch
+		rabbitEnabled = true
+		rabbitMu.Unlock()
+
+		rabbitConnectionStatus.Set(1)
+		backoff = time.Second // Reset backoff on success
+
+		logger.Info("RabbitMQ connected",
+			slog.String("host", host),
+			slog.String("vhost", vhost),
+		)
+
+		// Start consumer for this connection
+		consumerCtx, consumerCancel := context.WithCancel(ctx)
+		go startConsumer(consumerCtx)
+
+		// Wait for connection close notification
+		closeChan := make(chan *amqp.Error, 1)
+		conn.NotifyClose(closeChan)
+
+		select {
+		case <-ctx.Done():
+			consumerCancel()
+			return
+		case amqpErr := <-closeChan:
+			consumerCancel()
+			if amqpErr != nil {
+				logger.Warn("RabbitMQ connection lost, will reconnect",
+					slog.String("error", amqpErr.Error()),
+				)
+			} else {
+				logger.Info("RabbitMQ connection closed, will reconnect")
+			}
+			rabbitMu.Lock()
+			rabbitEnabled = false
+			rabbitConn = nil
+			rabbitChannel = nil
+			rabbitMu.Unlock()
+			rabbitConnectionStatus.Set(0)
+		}
 	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		logger.Error("failed to open RabbitMQ channel", slog.String("error", err.Error()))
-		rabbitConnectionStatus.Set(0)
-		return err
-	}
-
-	rabbitMu.Lock()
-	rabbitConn = conn
-	rabbitChannel = ch
-	rabbitEnabled = true
-	rabbitMu.Unlock()
-
-	rabbitConnectionStatus.Set(1)
-	logger.Info("RabbitMQ connected",
-		slog.String("host", host),
-		slog.String("vhost", vhost),
-	)
-
-	// Start background consumer for demo queue
-	go startConsumer(ctx)
-
-	return nil
 }
 
 // startConsumer starts a background consumer for the demo queue
@@ -933,12 +1030,8 @@ func main() {
 		}()
 	}
 
-	// Initialize RabbitMQ (optional - won't fail if not configured)
-	if err := initRabbitMQ(ctx); err != nil {
-		logger.Warn("RabbitMQ initialization failed, continuing without messaging",
-			slog.String("error", err.Error()),
-		)
-	}
+	// Start RabbitMQ connection manager (non-blocking, handles retries internally)
+	initRabbitMQ(ctx)
 	defer closeRabbitMQ()
 
 	appInfo.WithLabelValues(Version, Commit, BuildTime, getEnvironment()).Set(1)

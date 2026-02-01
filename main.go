@@ -1088,30 +1088,50 @@ func initValkey() {
 		DB:       db,
 	})
 
-	// Test connection
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Retry connection with exponential backoff
+	// Valkey may not be ready immediately during pod startup
+	maxRetries := 5
+	backoff := time.Second
 
-	if err := client.Ping(ctx).Err(); err != nil {
-		logger.Warn("failed to connect to Valkey",
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := client.Ping(ctx).Err()
+		cancel()
+
+		if err == nil {
+			valkeyMu.Lock()
+			valkeyClient = client
+			valkeyEnabled = true
+			valkeyMu.Unlock()
+
+			valkeyConnectionStatus.Set(1)
+			logger.Info("Valkey connected",
+				slog.String("addr", addr),
+				slog.Int("db", db),
+			)
+			return
+		}
+
+		logger.Warn("failed to connect to Valkey, retrying",
 			slog.String("addr", addr),
 			slog.Int("db", db),
+			slog.Int("attempt", attempt),
+			slog.Int("max_retries", maxRetries),
+			slog.Duration("backoff", backoff),
 			slog.String("error", err.Error()),
 		)
-		valkeyConnectionStatus.Set(0)
-		return
+
+		if attempt < maxRetries {
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+		}
 	}
 
-	valkeyMu.Lock()
-	valkeyClient = client
-	valkeyEnabled = true
-	valkeyMu.Unlock()
-
-	valkeyConnectionStatus.Set(1)
-	logger.Info("Valkey connected",
+	logger.Error("Valkey connection failed after all retries",
 		slog.String("addr", addr),
 		slog.Int("db", db),
 	)
+	valkeyConnectionStatus.Set(0)
 }
 
 // closeValkey closes the Valkey connection

@@ -1,5 +1,5 @@
 # Build stage
-FROM docker.io/library/golang:1.24-alpine AS builder
+FROM docker.io/library/golang:1.24-alpine@sha256:6b597b1078d050ed09eb75bc1942e1085ce2da15905190b4d01044f7bc612b81 AS builder
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o epochcloud-test .
 
 # Runtime stage
-FROM docker.io/library/alpine:3.21
+FROM docker.io/library/alpine:3.21@sha256:c3f8e73fdb79deaebaa2037150150191b9dcbfba68b4a46d70103204c53f4709
 
 # Install ca-certificates for HTTPS
 RUN apk --no-cache add ca-certificates
